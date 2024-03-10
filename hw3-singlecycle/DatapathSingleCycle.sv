@@ -11,7 +11,7 @@
 
 module RegFile (
     input logic [4:0] rd,
-    input logic [`REG_SIZE] rddata_,
+    input logic [`REG_SIZE] rd_data,
     input logic [4:0] rs1,
     output logic [`REG_SIZE] rs1_data,
     input logic [4:0] rs2,
@@ -21,38 +21,26 @@ module RegFile (
     input logic we,
     input logic rst
 );
-  
   localparam int NumRegs = 32;
   logic [`REG_SIZE] regs[NumRegs];
-  integer i;
 
   // TODO: your code here
-// Initialize register 0 to always be zero
-assign regs[0] = 32'd0; // x0 is always zero
 
-// Assign data from register rs1 to rs1_data (1st read port)
-assign rs1_data = regs[rs1]; // 1st read port
+  assign regs[0] = 32'd0;
+  assign rs1_data = regs[rs1];
+  assign rs2_data = regs[rs2];
+  always_ff @(posedge clk) begin
+    
+    if(1'b1 == rst) begin
+      for(int i = 1;i < NumRegs; i = i+1) begin
+        regs[i] <= 32'd0; 
+      end
+    end 
 
-// Assign data from register rs2 to rs2_data (2nd read port)
-assign rs2_data = regs[rs2]; // 2nd read port
-
-// Sequential logic block triggered on positive edge of clock
-always_ff @(posedge clk) begin
-  // Reset logic
-  if (rst == 1'b1) begin
-    // If reset is asserted, initialize all registers to zero
-    for (i=0; i < NumRegs; i++) begin
-      regs[i] <= 32'd0;
-    end
-  end else begin
-    // Write enable and write data logic
-    if ((we==1'b1) && (rd != 5'd0)) begin // if read and write happen at once
-      // If write enable is asserted and the destination register is not x0,
-      // then update the register with the provided write data
-      regs[rd] <= rddata_;
+    if(we && (|rd) == 1'b1 ) begin
+      regs[rd] <= rd_data;
     end
   end
-end
 endmodule
 
 module DatapathSingleCycle (
@@ -62,11 +50,13 @@ module DatapathSingleCycle (
     output logic [`REG_SIZE] pc_to_imem,
     input wire [`REG_SIZE] insn_from_imem,
     // addr_to_dmem is a read-write port
-    output wire [`REG_SIZE] addr_to_dmem,
+    output logic [`REG_SIZE] addr_to_dmem,
     input logic [`REG_SIZE] load_data_from_dmem,
-    output wire [`REG_SIZE] store_data_to_dmem,
-    output wire [3:0] store_we_to_dmem
+    output logic [`REG_SIZE] store_data_to_dmem,
+    output logic [3:0] store_we_to_dmem
 );
+
+  logic [31:0] add_bits;
 
   // components of the instruction
   wire [6:0] insn_funct7;
@@ -75,7 +65,19 @@ module DatapathSingleCycle (
   wire [2:0] insn_funct3;
   wire [4:0] insn_rd;
   wire [`OPCODE_SIZE] insn_opcode;
-
+  logic [`REG_SIZE] rs1_data, rs2_data, rd_data;
+  logic we;
+//instance for regfile in datapath
+  RegFile rf(
+    .clk(clk), .rst(rst),  .we(we), .rd(insn_rd), .rd_data(rd_data),
+    .rs1(insn_rs1), .rs2(insn_rs2), .rs1_data(rs1_data),  .rs2_data(rs2_data)
+  );
+  //instance for divider in datapath
+  logic [31:0] dividend, divisor, remainder, quotient;
+  logic is_zero, rs1, rs2;
+  divider_unsigned divu(
+    .i_dividend(dividend), .i_divisor(divisor), .o_remainder(remainder), .o_quotient(quotient)
+  );
   // split R-type instruction - see section 2.2 of RiscV spec
   assign {insn_funct7, insn_rs2, insn_rs1, insn_funct3, insn_rd, insn_opcode} = insn_from_imem;
 
@@ -115,11 +117,9 @@ module DatapathSingleCycle (
   localparam bit [`OPCODE_SIZE] OpEnviron = 7'b11_100_11;
 
   localparam bit [`OPCODE_SIZE] OpAuipc = 7'b00_101_11;
+
+  // edited: user added
   localparam bit [`OPCODE_SIZE] OpLui = 7'b01_101_11;
-  localparam bit [`OPCODE_SIZE] Op_I_ = 7'b0010011;
-  localparam bit [`OPCODE_SIZE] OpR = 7'b0110011;
-  localparam bit [`OPCODE_SIZE] Op_U_ = 7'b01_101_11;
-  localparam bit [`OPCODE_SIZE] Op_ecall_ = 7'b1110011;
 
   wire insn_lui = insn_opcode == OpLui;
   wire insn_auipc = insn_opcode == OpAuipc;
@@ -193,7 +193,7 @@ module DatapathSingleCycle (
   // synthesis translate_on
 
   // program counter
-  logic [`REG_SIZE] pcNext, pcCurrent;
+  logic [`REG_SIZE] pcNext, pcCurrent, pcTemp;
   always @(posedge clk) begin
     if (rst) begin
       pcCurrent <= 32'd0;
@@ -217,203 +217,343 @@ module DatapathSingleCycle (
     end
   end
 
-logic illegal_insn;       // Flag indicating an illegal instruction
-logic [`REG_SIZE] rs1_data_;  // Data from register rs1
-logic [`REG_SIZE] rs2_data_;  // Data from register rs2
-logic welui_;             // Write enable for register file
+  logic illegal_insn;
 
 
+  logic [`REG_SIZE]  a_add, b_add;
+  logic c_i_add;
+  logic [`REG_SIZE] sum_add;
 
+  logic [63:0] product;
+  logic [31:0] sign_prod;
+  logic [63:0] final_prod;
+  logic [31:0] addr;
+  logic branch;
 
-logic [`REG_SIZE] pcinc_;     // Value to increment PC by
-logic [63:0] multires_;       // Multiplier result
+  cla add (.a(a_add), .b(b_add), .cin(c_i_add), .sum(sum_add));
 
-
-
-
-
-logic [`REG_SIZE] rddata_;    // Data to be written back to register file
-logic [`REG_SIZE] alu_a_, alu_b_;  // Inputs to ALU
-logic alu_cin_;             // Carry-in for ALU
-logic [`REG_SIZE] alusum_;      // Output of ALU
-
-logic branch_taken;          // Flag indicating a branch is taken
-
-// Instantiate Register File module
-RegFile rf(.rd(insn_rd), .rddata_(rddata_), .rs1(insn_rs1), .rs1_data(rs1_data_), 
-           .rs2(insn_rs2), .rs2_data(rs2_data_), .clk(clk), .we(welui_) , .rst(rst));
-
-// Instantiate Carry Look-Ahead (CLA) Adder module
-cla alu (.a(alu_a_), .b(alu_b_), .cin(alu_cin_), .sum(alusum_));
-
-always_comb begin
-    // Initialize flags and signals
-    welui_ = 1'b0;
-    alu_cin_ = 1'b0;
+    always_comb begin
     illegal_insn = 1'b0;
-    halt = 1'b0;  
+    halt = 1'b0;
+    we = 1'b0;
+    c_i_add= 1'b0;
+    branch = 1'b0;
+    addr = 32'h0;
+    store_we_to_dmem = 4'b0000;
 
-    // Control flow based on instruction type
+    if (insn_fence == 1'b1) begin
+      // halt = 1'b1;
+      illegal_insn = 1'b0;
+      we = 1'b0;
+    end
 
     if (insn_bne == 1'b1) begin
-      pcinc_ = (rs1_data_ != rs2_data_) ? imm_b_sext: 32'd4;
+      pcTemp = (rs1_data != rs2_data) ? imm_b_sext: 32'd4;
     end else if (insn_beq == 1'b1) begin
-      pcinc_ = (rs1_data_ == rs2_data_) ? imm_b_sext : 32'd4;
-
+      pcTemp = (rs1_data == rs2_data) ? imm_b_sext : 32'd4;
     end else if (insn_blt == 1'b1) begin
-      pcinc_ = ($signed(rs1_data_) < $signed(rs2_data_)) ? imm_b_sext : 32'd4;
-
+      pcTemp = ($signed(rs1_data) < $signed(rs2_data)) ? imm_b_sext : 32'd4;
     end else if (insn_bge == 1'b1) begin
-      pcinc_ = ($signed(rs1_data_) >= $signed(rs2_data_)) ? imm_b_sext : 32'd4;
-
+      pcTemp = ($signed(rs1_data) >= $signed(rs2_data)) ? imm_b_sext : 32'd4;
     end else if (insn_bltu == 1'b1) begin
-      pcinc_ = ($signed(rs1_data_) < $unsigned(rs2_data_)) ? imm_b_sext : 32'd4;
-
+      pcTemp = ($signed(rs1_data) < $unsigned(rs2_data)) ? imm_b_sext : 32'd4;
     end else if (insn_bgeu == 1'b1) begin
-      pcinc_ = ($signed(rs1_data_) >= $unsigned(rs2_data_)) ? imm_b_sext : 32'd4;
-
+      pcTemp = ($signed(rs1_data) >= $unsigned(rs2_data)) ? imm_b_sext : 32'd4;
     end else begin
-      pcinc_ = 32'd4;
+      pcTemp = 32'd4;
     end
 
     if (insn_ecall == 1'b1) begin
       halt = 1'b1;
+      illegal_insn = 1'b0;
+      we = 1'b0;
     end
-
-    case (insn_opcode)
-      Op_U_: begin
-        welui_ = 1'b1;
-        if (insn_rd == 5'b0) begin
-          rddata_ = 32'b0;
-        end else begin
-          rddata_ = {insn_from_imem[31:12], 12'd0};
+  
+    else if(OpStore == insn_opcode) begin
+      halt = 1'b0;
+      illegal_insn = 1'b0;
+      add_bits = (rs1_data + imm_s_sext);
+      addr_to_dmem = add_bits & 32'hFFFFFFFC;
+      we = 1'b0;
+      if(insn_sb) begin
+        if(add_bits[1:0] == 2'b00) begin
+          store_data_to_dmem[7:0] = rs2_data[7:0];
+          store_we_to_dmem = 4'b0001;
+        end
+        else if(add_bits[1:0] == 2'b01) begin
+          store_data_to_dmem[15:8] = rs2_data[7:0];
+          store_we_to_dmem = 4'b0010;
+        end
+        else if(add_bits[1:0] == 2'b10) begin
+          store_data_to_dmem[23:16] = rs2_data[7:0];
+          store_we_to_dmem = 4'b0100;
+        end
+        else if(add_bits[1:0] == 2'b11) begin
+          store_data_to_dmem[31:24] = rs2_data[7:0];
+          store_we_to_dmem = 4'b1000;
         end
       end
+      else if(insn_sh) begin
+        if(add_bits[1:0] == 2'b00) begin
+          store_data_to_dmem[15:0] = rs2_data[15:0];
+          store_we_to_dmem = 4'b0011;
+        end
+        else if(add_bits[1:0] == 2'b10) begin
+          store_data_to_dmem[31:16] = rs2_data[15:0];
+          store_we_to_dmem = 4'b1100;
+        end
+      end
+      else if(insn_sw) begin
+        store_data_to_dmem = rs2_data;
+        store_we_to_dmem = 4'b1111;
+      end
+    end
+    else if(OpLoad == insn_opcode)
+    begin
+      addr = (rs1_data + imm_i_sext);
+      addr_to_dmem = (addr)&32'hFFFFFFFC;
+      we = 1'b1;
+      halt = 1'b0;
+      illegal_insn = 1'b0;
+      if(insn_lb == 1'b1)
+      begin
+        if(addr[1:0] == 2'b00) begin
+          rd_data = 32'(signed'(load_data_from_dmem[7:0]));
+        end
+        else if(addr[1:0] == 2'b01) begin
+          rd_data = 32'(signed'(load_data_from_dmem[15:8]));
+        end
+        else if(addr[1:0] == 2'b10) begin
+          rd_data = 32'(signed'(load_data_from_dmem[23:16]));
+        end
+        else if(addr[1:0] == 2'b11) begin
+          rd_data = 32'(signed'(load_data_from_dmem[31:24]));
+        end
+      end
+      else if(insn_lbu == 1'b1)
+      begin
+       if(addr[1:0] == 2'b00) begin
+          rd_data = 32'(unsigned'(load_data_from_dmem[7:0]));
+        end
+        else if(addr[1:0] == 2'b01) begin
+          rd_data = 32'(unsigned'(load_data_from_dmem[15:8]));
+        end
+        else if(addr[1:0] == 2'b10) begin
+          rd_data = 32'(unsigned'(load_data_from_dmem[23:16]));
+        end
+        else if(addr[1:0] == 2'b11) begin
+          rd_data = 32'(unsigned'(load_data_from_dmem[31:24]));
+        end
+      end
+      else if(insn_lh == 1'b1)
+      begin
+        if(addr[1:0] == 2'b00) begin
+          rd_data = 32'(signed'(load_data_from_dmem[15:0]));
+        end
+        else if(addr[1:0] == 2'b10) begin
+          rd_data = 32'(signed'(load_data_from_dmem[31:16]));
+        end
+      end
+      else if(insn_lhu == 1'b1)
+      begin
+        if(addr[1:0] == 2'b00) begin
+          rd_data = 32'(unsigned'(load_data_from_dmem[15:0]));
+        end
+        else if(addr[1:0] == 2'b10) begin
+          rd_data = 32'(unsigned'(load_data_from_dmem[31:16]));
+        end
+      end
+      else if(insn_lw == 1'b1)
+      begin
+        rd_data = load_data_from_dmem;
+      end
+    end
 
+    else if(insn_jal == 1'b1)
+    begin
+      we = 1'b1;
+      halt = 1'b0;
+      pcTemp = imm_j_sext;
+      rd_data = pcCurrent + 4;
+    end
+    if(insn_jalr == 1'b1)
+    begin
+      we = 1'b1;
+      halt = 1'b0;
+      rd_data = pcCurrent + 4;
+      pcTemp = rs1_data +imm_i_sext + ~pcCurrent + 1;
+    end
+    if(insn_auipc)
+    begin
+      we = 1'b1;
+      halt = 1'b0;
+      rd_data = pcCurrent + {insn_from_imem[31:12],12'd0};
+    end
+    case (insn_opcode)
+      OpLui : begin
+        we = 1'b1;
+        rd_data[31:12] = insn_from_imem[31:12];
+        rd_data[11:0] = 12'd0;
+      end
 
-
-
-
-
-
-      Op_I_ : begin
-        if (insn_addi == 1'b1) begin  // Addi
-          alu_cin_ = 1'b0;
-          welui_ = 1'b1;
-          alu_b_ = imm_i_sext;
-          rddata_ = alusum_;
-          alu_a_ = rs1_data_;
-
+      OpRegImm : begin
+        if (insn_addi == 1'b1) begin
+          c_i_add= 1'b0;
+          we = 1'b1;
+          a_add= rs1_data;
+          b_add= imm_i_sext;
+          rd_data = sum_add;
         end 
         
-        if (insn_slti == 1'b1) begin  
-          welui_ = 1'b1;
-          rddata_ = $signed(rs1_data_) < $signed(imm_i_sext) ? 32'b1 : 32'b0;
+        if (insn_slti == 1'b1) begin
+          we = 1'b1; 
+          rd_data = $signed(rs1_data) < $signed(imm_i_sext) ? 32'b1 : 32'b0;
         end else if (insn_sltiu == 1'b1) begin
-          welui_ = 1'b1;  
-          rddata_ = $signed(rs1_data_) < $unsigned(imm_i_sext) ? 32'b1 : 32'b0;
+          we = 1'b1; 
+          rd_data = $signed(rs1_data) < $unsigned(imm_i_sext) ? 32'b1 : 32'b0;
         end
 
-         if (insn_ori == 1'b1) begin  
-          welui_ = 1'b1;
-          rddata_ = $signed(rs1_data_) | imm_i_sext;
+        if (insn_xori == 1'b1) begin
+          we = 1'b1;
+          rd_data =  (rs1_data ^ 32'(signed'(imm_i)));
         end
 
-        if (insn_andi == 1'b1) begin  
-          welui_ = 1'b1;
-          rddata_ = $signed(rs1_data_) & imm_i_sext;
+        if (insn_ori == 1'b1) begin
+          we = 1'b1;
+          rd_data = (rs1_data | 32'(signed'(imm_i)));
         end
 
-        if (insn_xori == 1'b1) begin  
-          welui_ = 1'b1;
-          rddata_ = $signed(rs1_data_) ^ imm_i_sext;
+        if (insn_andi == 1'b1) begin
+          we = 1'b1;
+          rd_data =  (rs1_data & 32'(signed'(imm_i)));
         end
 
-        if (insn_slli == 1'b1) begin  
-          welui_ = 1'b1;
-          rddata_ = rs1_data_ << imm_shamt;
+        if (insn_slli == 1'b1) begin 
+          we = 1'b1;
+          rd_data = (rs1_data << 32'(signed'(imm_i)));
         end else if (insn_srli == 1'b1) begin
-          welui_ = 1'b1;
-          rddata_ = rs1_data_ >> imm_shamt;
+          we = 1'b1;
+          rd_data = (rs1_data >> 32'(signed'(imm_i)));
         end
         
         if (insn_srai == 1'b1) begin
-          welui_ = 1'b1;
-          rddata_ = $signed(rs1_data_) >>> imm_shamt;
+          we = 1'b1;
+          rd_data = $signed(rs1_data) >>> imm_shamt;
         end
-
       end
 
-      OpR : begin
-        if (insn_add == 1'b1) begin
-          alu_cin_ = 1'b0;
-          alu_a_ = rs1_data_;
-          alu_b_ = rs2_data_;
-          rddata_ = alusum_;
-          welui_ = 1'b1;
+      OpRegReg : begin
+        we = 1'b1;
 
+        if (insn_add == 1'b1) begin
+          c_i_add= 1'b0;
+          we = 1'b1;
+          a_add= rs1_data;
+          b_add= rs2_data;
+          rd_data = sum_add;
         end
 
         if (insn_sub == 1'b1) begin
-          //welui_ = 1'b1;
-          //rddata_ = rs1_data_ - rs2_data_;
-          alu_cin_ = 1'b1;
-          welui_ = 1'b1;
-          alu_a_ = rs1_data_;
-          alu_b_ = ~rs2_data_;
-          rddata_ = alusum_;
+          c_i_add= 1'b1;
+          we = 1'b1;
+          a_add= rs1_data;
+          b_add= ~rs2_data;
+          rd_data = sum_add;
         end
 
         if (insn_sll == 1'b1) begin
-          welui_ = 1'b1;
-          rddata_ = rs1_data_ << rs2_data_[4:0];
-        end
-
-        if (insn_srl == 1'b1) begin
-          welui_ = 1'b1;
-          rddata_ = rs1_data_ >> (rs2_data_[4:0]);
-        end
-        
-        if (insn_sra == 1'b1) begin
-          welui_ = 1'b1;
-          rddata_ = $signed(rs1_data_) >>> rs2_data_[4:0];
-        end
-
-        if (insn_or == 1'b1) begin
-          welui_ = 1'b1;
-          rddata_ = rs1_data_ | rs2_data_;
+          we = 1'b1;
+          rd_data = rs1_data << rs2_data[4:0];
         end
 
         if (insn_slt == 1'b1) begin
-          welui_ = 1'b1;
-          rddata_ = $signed(rs1_data_) < $signed(rs2_data_) ? 32'b1 : 32'b0;
+          we = 1'b1;
+          rd_data = $signed(rs1_data) < $signed(rs2_data) ? 32'b1 : 32'b0;
         end else if (insn_sltu == 1'b1) begin
-          welui_ = 1'b1;
-          rddata_ = rs1_data_ < $unsigned(rs2_data_) ? 32'b1 : 32'b0;
+          we = 1'b1;
+          rd_data = rs1_data < $unsigned(rs2_data) ? 32'b1 : 32'b0;
         end
 
         if (insn_xor == 1'b1) begin
-          welui_ = 1'b1;
-          rddata_ = rs1_data_ ^ rs2_data_;
+          we = 1'b1;
+          rd_data = rs1_data ^ rs2_data;
+        end
+
+        if (insn_srl == 1'b1) begin
+          we = 1'b1;
+          rd_data = rs1_data >> (rs2_data[4:0]);
+        end
+        
+        if (insn_sra == 1'b1) begin
+          we = 1'b1;
+          rd_data = $signed(rs1_data) >>> rs2_data[4:0];
+        end
+
+        if (insn_or == 1'b1) begin
+          we = 1'b1;
+          rd_data = rs1_data | rs2_data;
         end
 
         if (insn_and == 1'b1) begin
-          welui_ = 1'b1;
-          rddata_ = rs1_data_ & rs2_data_;
+          we = 1'b1;
+          rd_data = rs1_data & rs2_data;
         end
 
         if (insn_mul == 1'b1) begin
-          multires_ = rs1_data_ * rs2_data_;
-          rddata_ = multires_[31:0];
-        end else if (insn_mulh) begin
-          multires_ = $signed(rs1_data_) * $signed(rs2_data_);
-          rddata_ = multires_[63:32];
-        end else if (insn_mulhsu) begin
-          multires_ = $signed(rs1_data_) * $unsigned(rs2_data_);
-          rddata_ = multires_[63:32];
-        end else if (insn_mulhu) begin
-          multires_ = $unsigned(rs1_data_) * $unsigned(rs2_data_);
-          rddata_ = multires_[63:32];
+          product = rs1_data * rs2_data;
+          rd_data = product[31:0];
+        end else if (insn_mulh == 1'b1) begin
+          product = $signed(rs1_data) * $signed(rs2_data);
+          rd_data = product[63:32];
+        end else if (insn_mulhsu == 1'b1) begin
+          if (rs1_data[31] == 1'b1) begin
+            sign_prod = ~(rs1_data) + 32'b1;
+          end else begin
+            sign_prod = rs1_data;
+          end
+
+          product = sign_prod * rs2_data;
+
+          if (rs1_data[31] == 1'b1) begin
+            final_prod = ~product + 64'b1;
+          end else begin
+            final_prod = product;
+          end
+          rd_data = final_prod[63:32];
+        end else if (insn_mulhu == 1'b1) begin
+          product = $unsigned(rs1_data) * $unsigned(rs2_data);
+          rd_data = product[63:32];
+        end
+
+        if (insn_div == 1'b1) begin
+          rs1 = rs1_data[31];
+          rs2 = rs2_data[31];
+          is_zero = (rs1_data == 0) | (rs2_data == 0)  ;
+          dividend = rs1_data[31] ? (~rs1_data + 1) : rs1_data;
+          divisor = rs2_data[31] ? (~rs2_data + 1) : rs2_data;
+          rd_data = is_zero ? $signed(32'hFFFFFFFF) : ((rs1 != rs2) ? (~quotient + 1) : quotient); 
+        end else if (insn_divu == 1'b1) begin
+          is_zero = (rs1_data == 0) | (rs2_data == 0)  ;
+          dividend = $unsigned(rs1_data);
+          divisor = $unsigned(rs2_data);
+          rd_data = is_zero ? $signed(32'hFFFFFFFF) : quotient;
+        end else if (insn_rem == 1'b1) begin
+          rs1 = rs1_data[31];
+          rs2 = rs2_data[31];
+          is_zero = (rs1_data == 0) | (rs2_data == 0)  ;
+          dividend = rs1_data[31] ? (~rs1_data + 1) : rs1_data;
+          divisor = rs2_data[31] ? (~rs2_data + 1) : rs2_data;
+          if (!is_zero ) begin
+              rd_data = (rs1 == 1'b1)?(~remainder + 1):(remainder);
+          end 
+          else begin
+              rd_data = rs1_data[31] ? (~rs1_data + 1) : rs1_data;
+          end
+        end else if (insn_remu == 1'b1) begin
+          dividend = $unsigned(rs1_data);
+          divisor = $unsigned(rs2_data);
+          is_zero = (rs1_data == 0) | (rs2_data == 0)  ;
+          rd_data = (is_zero)?$unsigned(rs1_data):remainder;
         end
 
       end
@@ -423,15 +563,17 @@ always_comb begin
       end
     endcase
 
-    pcNext = pcCurrent + pcinc_;
-
-
+    if (branch == 1'b0) begin
+      pcNext = pcCurrent + pcTemp;
+    end
+  
   end
-
-
+  
 endmodule
 
-
+/* A memory module that supports 1-cycle reads and writes, with one read-only port
+ * and one read+write port.
+ */
 module MemorySingleCycle #(
     parameter int NUM_WORDS = 512
 ) (
@@ -444,16 +586,16 @@ module MemorySingleCycle #(
     // must always be aligned to a 4B boundary
     input wire [`REG_SIZE] pc_to_imem,
 
-    // the value at memory location pc_to_imem
+    // the vadde at memory location pc_to_imem
     output logic [`REG_SIZE] insn_from_imem,
 
     // must always be aligned to a 4B boundary
     input wire [`REG_SIZE] addr_to_dmem,
 
-    // the value at memory location addr_to_dmem
+    // the vadde at memory location addr_to_dmem
     output logic [`REG_SIZE] load_data_from_dmem,
 
-    // the value to be written to addr_to_dmem, controlled by store_we_to_dmem
+    // the vadde to be written to addr_to_dmem, controlled by store_we_to_dmem
     input wire [`REG_SIZE] store_data_to_dmem,
 
     // Each bit determines whether to write the corresponding byte of store_data_to_dmem to memory location addr_to_dmem.
@@ -499,7 +641,7 @@ module MemorySingleCycle #(
       if (store_we_to_dmem[3]) begin
         mem[addr_to_dmem[AddrMsb:AddrLsb]][31:24] <= store_data_to_dmem[31:24];
       end
-      // dmem is "read-first": read returns value before the write
+      // dmem is "read-first": read returns vadde before the write
       load_data_from_dmem <= mem[{addr_to_dmem[AddrMsb:AddrLsb]}];
     end
   end
@@ -525,7 +667,7 @@ module RiscvProcessor (
     output logic halt
 );
 
-  wire [`REG_SIZE] pc_to_imem, insn_from_imem, mem_data_addr, mem_data_loaded_value, mem_data_to_write;
+  wire [`REG_SIZE] pc_to_imem, insn_from_imem, mem_data_addr, mem_data_loaded_vadde, mem_data_to_write;
   wire [3:0] mem_data_we;
 
   MemorySingleCycle #(
@@ -538,7 +680,7 @@ module RiscvProcessor (
       .insn_from_imem(insn_from_imem),
       // dmem is read-write
       .addr_to_dmem(mem_data_addr),
-      .load_data_from_dmem(mem_data_loaded_value),
+      .load_data_from_dmem(mem_data_loaded_vadde),
       .store_data_to_dmem (mem_data_to_write),
       .store_we_to_dmem  (mem_data_we)
   );
@@ -551,7 +693,7 @@ module RiscvProcessor (
       .addr_to_dmem(mem_data_addr),
       .store_data_to_dmem(mem_data_to_write),
       .store_we_to_dmem(mem_data_we),
-      .load_data_from_dmem(mem_data_loaded_value),
+      .load_data_from_dmem(mem_data_loaded_vadde),
       .halt(halt)
   );
 
